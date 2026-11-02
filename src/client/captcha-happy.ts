@@ -2130,6 +2130,15 @@ let _dualConsole: Record<string, unknown> | null = null;
 // restored on the last destroyDom.
 let _savedTimerDescriptors: Record<string, PropertyDescriptor> | undefined;
 
+// Record-restore for the generic window-alias pass. Node ≥ 22 exposes several
+// globals (Buffer, performance, navigator, crypto, process) as ACCESSORS on
+// globalThis; the old sweep-delete removed anything with a getter, so it also
+// deleted Node's own native accessors — after the first solve `Buffer` was
+// gone and the host (Pi's TUI stdin reader) crashed with
+// "ReferenceError: Buffer is not defined". Capture every descriptor we shadow
+// before shadowing it, then restore exactly those on the last destroyDom.
+let _savedAliasDescriptors: Map<string, PropertyDescriptor | undefined> | undefined;
+
 const TIMER_PROPS = ["setTimeout", "setInterval", "clearTimeout", "clearInterval"];
 
 // Guest-stack detector shared by the dual console and dual timers: guest
@@ -2245,6 +2254,13 @@ export function installGlobalWindowAlias(g, w) {
       _savedTimerDescriptors[prop] = Object.getOwnPropertyDescriptor(g, prop);
     }
   }
+  if (_aliasRefCount === 1 && !_savedAliasDescriptors) {
+    _savedAliasDescriptors = new Map();
+  }
+  const rememberDescriptor = (name: string): void => {
+    if (!_savedAliasDescriptors || _savedAliasDescriptors.has(name)) return;
+    _savedAliasDescriptors.set(name, Object.getOwnPropertyDescriptor(g, name));
+  };
   const props = new Set(Object.getOwnPropertyNames(w));
   for (const name of EXTRA_WINDOW_PROPS) props.add(name);
   // also walk the prototype chain one level (BrowserWindow getters like
@@ -2255,6 +2271,7 @@ export function installGlobalWindowAlias(g, w) {
   }
   for (const prop of props) {
     if (HOST_CRITICAL_GLOBALS.has(prop)) continue;
+    rememberDescriptor(prop);
     try {
       Object.defineProperty(g, prop, {
         get() {
@@ -2271,6 +2288,7 @@ export function installGlobalWindowAlias(g, w) {
   }
   // w.window/self may not exist as own props on this happy-dom build
   for (const prop of ["window", "self", "top", "parent"]) {
+    rememberDescriptor(prop);
     try {
       Object.defineProperty(g, prop, {
         get() {
@@ -2322,6 +2340,7 @@ export function installGlobalWindowAlias(g, w) {
   // only exist on the prototype (moveBy, scrollTo, ...) or lands mid-solve on
   // new props. Proxy fallback for any still-missing global property.
   try {
+    rememberDescriptor("__capWindowFor");
     Object.defineProperty(g, "__capWindowFor", {
       get() {
         return w;
@@ -2333,16 +2352,19 @@ export function installGlobalWindowAlias(g, w) {
 export function removeGlobalWindowAlias(g, w) {
   _aliasRefCount -= 1;
   if (_aliasRefCount > 0) return;
-  for (const name of Object.getOwnPropertyNames(w)) {
-    try {
-      const d = Object.getOwnPropertyDescriptor(g, name);
-      if (d?.get) delete g[name];
-    } catch (_) {}
-  }
-  for (const prop of ["window", "self", "top", "parent"]) {
-    try {
-      delete g[prop];
-    } catch (_) {}
+  // Restore exactly what installGlobalWindowAlias shadowed. Sweeping
+  // `Object.getOwnPropertyNames(w)` and deleting every global with a getter
+  // used to take Node's OWN native accessors with it (Buffer, performance,
+  // navigator, crypto) — the host lost `Buffer` and crashed after the first
+  // captcha solve. Anything we never recorded is left untouched.
+  if (_savedAliasDescriptors) {
+    for (const [name, desc] of _savedAliasDescriptors) {
+      try {
+        if (desc) Object.defineProperty(g, name, desc);
+        else delete g[name];
+      } catch (_) {}
+    }
+    _savedAliasDescriptors = undefined;
   }
   // Restore the pre-alias console descriptor — `delete g.console` above (the
   // getter installed for the dual console) would otherwise leave globalThis
