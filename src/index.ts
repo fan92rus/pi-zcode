@@ -11,18 +11,37 @@ import {
 import { getLastDiagnostics, runWithDiagnostics } from "./diagnostics/index.js";
 import {
   buildModelsForPlan,
+  DEFAULT_THINKING_LEVEL_MAP,
   fetchModelCatalog,
   fetchModelIdsForPlan,
   PROVIDER_ID,
-  providerIdForPlan,
-  PROVIDER_NAMES,
 } from "./models/index.js";
 import { detectAccountPlans } from "./plans/index.js";
-import { ZCODE_API, streamZCode } from "./stream/index.js";
+import { setFallbackPlan, ZCODE_API, streamZCode } from "./stream/index.js";
 import { ZCodePlan, ZCodePlanStatus } from "./types/enums.js";
 import type { ZCodeAccountPlans, ZCodeParsedApiKey } from "./types/types.js";
 import { fetchAccountUsage, formatUsageReport, resolveApiKeyFromContext } from "./usage/index.js";
 import { redactSecrets } from "./utils/index.js";
+
+/**
+ * Models pi can resolve BEFORE the live entitlement probe finishes.
+ *
+ * Registering the provider with an empty model list made pi fall back to its
+ * own default model (anthropic/claude-opus) while the async plan detection was
+ * still in flight — the request went to a completely different provider. These
+ * static entries keep `zcode/<model>` addressable from the first millisecond;
+ * the live catalog replaces them as soon as detection completes.
+ */
+const STATIC_FALLBACK_MODELS = ["glm-5.3", "glm-5.3-flash"].map((id) => ({
+  id,
+  name: id === "glm-5.3" ? "GLM-5.3" : "GLM-5.3-Flash",
+  contextWindow: 1_000_000,
+  maxTokens: 128_000,
+  reasoning: true,
+  input: ["text", "image"] as ("text" | "image")[],
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  thinkingLevelMap: DEFAULT_THINKING_LEVEL_MAP,
+}));
 
 function emitCommandOutput(
   ctx: ExtensionCommandContext,
@@ -58,54 +77,50 @@ export async function detectAndRegisterPlans(
   const plans = await runWithDiagnostics(() => detectAccountPlans(credsPayload));
   const catalog = await fetchModelCatalog(credentials.zcodeJwtToken);
 
-  const registrations: { plan: ZCodePlan; ids: string[] | undefined }[] = [];
-
-  if (plans.startPlan.status === ZCodePlanStatus.ACTIVE) {
-    registrations.push({ plan: ZCodePlan.START_PLAN, ids: plans.startPlan.models });
-  }
-  if (plans.individualPlan.status === ZCodePlanStatus.ACTIVE) {
-    registrations.push({ plan: ZCodePlan.INDIVIDUAL_PLAN, ids: undefined });
-  }
+  // Single provider policy: pi shows ONE provider (`zcode`); the extension
+  // routes each request to the plan the account is actually entitled to.
+  // Registering per-plan providers only cluttered /model and — worse — left
+  // the plain `zcode` provider bound to START_PLAN, which answers 401 for a
+  // paid account (and drags in a captcha solve).
+  const activePlan =
+    plans.individualPlan.status === ZCodePlanStatus.ACTIVE
+      ? ZCodePlan.INDIVIDUAL_PLAN
+      : plans.startPlan.status === ZCodePlanStatus.ACTIVE
+        ? ZCodePlan.START_PLAN
+        : undefined;
+  setFallbackPlan(activePlan);
 
   const allActiveModels = [];
 
-  for (const reg of registrations) {
+  if (activePlan === ZCodePlan.INDIVIDUAL_PLAN) {
     const ids = await fetchModelIdsForPlan(
-      reg.plan,
+      ZCodePlan.INDIVIDUAL_PLAN,
+      credentials
+        ? JSON.stringify({ access: credentials.token, providerSource: credentials.providerSource })
+        : undefined,
+      undefined,
+    );
+    allActiveModels.push(...buildModelsForPlan(ids, catalog));
+  } else if (activePlan === ZCodePlan.START_PLAN) {
+    const ids = await fetchModelIdsForPlan(
+      ZCodePlan.START_PLAN,
       credentials
         ? JSON.stringify({
             access: credentials.token,
             providerSource: credentials.providerSource,
           })
         : undefined,
-      reg.ids,
+      plans.startPlan.models,
     );
-
-    if (!ids.length) {
-      continue;
-    }
-
-    const models = buildModelsForPlan(ids, catalog);
-    const providerId = providerIdForPlan(reg.plan);
-
-    // Register dedicated provider for this plan (e.g. zcode-start-plan)
-    pi.registerProvider(providerId, {
-      name: PROVIDER_NAMES[reg.plan],
-      baseUrl: DEFAULT_ENDPOINT,
-      api: ZCODE_API,
-      models,
-      streamSimple: streamZCode,
-    });
-
-    allActiveModels.push(...models);
+    allActiveModels.push(...buildModelsForPlan(ids, catalog));
   }
 
-  // Also register active models on the base `zcode` provider so /model zcode/<model> works
+  // Register active models on the single `zcode` provider so /model zcode/<model> works
   pi.registerProvider(PROVIDER_ID, {
     name: "ZCode",
     baseUrl: DEFAULT_ENDPOINT,
     api: ZCODE_API,
-    models: allActiveModels,
+    models: allActiveModels.length > 0 ? allActiveModels : STATIC_FALLBACK_MODELS,
     oauth: {
       name: "ZCode",
       login: async (callbacks) => {
@@ -146,7 +161,7 @@ export default async function initZCodeExtension(pi: ExtensionAPI): Promise<void
     name: "ZCode",
     baseUrl: DEFAULT_ENDPOINT,
     api: ZCODE_API,
-    models: [],
+    models: STATIC_FALLBACK_MODELS,
     oauth: {
       name: "ZCode",
       login: async (callbacks) => {

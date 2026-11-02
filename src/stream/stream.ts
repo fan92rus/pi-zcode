@@ -15,8 +15,8 @@ import {
 } from "@earendil-works/pi-ai";
 import {
   acquireCaptchaVerifyParam,
+  buildLlmZCodeHeaders,
   buildStartPlanHeaders,
-  buildZCodeHeaders,
   getOrSolveCaptchaParam,
   getStagedCaptchaParam,
   parseApiKey,
@@ -99,6 +99,118 @@ function convertTools(tools?: Tool[]): Record<string, unknown>[] | undefined {
     description: tool.description,
     input_schema: tool.parameters,
   }));
+}
+
+/** OpenAI chat-completions tool schema (`{type:"function", function:{...}}`). */
+function convertToolsOpenAI(tools?: Tool[]): Record<string, unknown>[] | undefined {
+  if (!tools || tools.length === 0) {
+    return undefined;
+  }
+  return tools.map((tool) => ({
+    type: "function",
+    function: {
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.parameters,
+    },
+  }));
+}
+
+function toolResultText(message: { content: unknown }): string {
+  if (typeof message.content === "string") {
+    return message.content;
+  }
+  if (Array.isArray(message.content)) {
+    return message.content
+      .filter((p: any) => p?.type === "text")
+      .map((p: any) => p.text)
+      .join("\n");
+  }
+  return "";
+}
+
+/**
+ * OpenAI chat-completions message list for the Individual Plan endpoint.
+ *
+ * The Anthropic-shaped converter is not reusable here: OpenAI has no
+ * `tool_use`/`tool_result` content blocks (it uses `assistant.tool_calls` and a
+ * `role:"tool"` message) and carries images as `image_url` data URLs. Sending
+ * Anthropic blocks made the upstream silently ignore every tool, which looked
+ * like "the model refuses to use tools".
+ */
+function convertMessagesOpenAI(context: Context, systemPrompt: string): Record<string, unknown>[] {
+  const messages: Record<string, unknown>[] = [];
+
+  if (systemPrompt && systemPrompt.trim().length > 0) {
+    messages.push({ role: "system", content: systemPrompt });
+  }
+
+  for (const message of context.messages) {
+    // System messages were folded into `systemPrompt` above; OpenAI accepts one
+    // leading system message, not a stream of them.
+    if ((message as { role: string }).role === "system") {
+      continue;
+    }
+    if (message.role === "user") {
+      if (typeof message.content === "string") {
+        messages.push({ role: "user", content: message.content });
+      } else if (Array.isArray(message.content)) {
+        const parts: Record<string, unknown>[] = [];
+        for (const part of message.content) {
+          if (part.type === "text") {
+            parts.push({ type: "text", text: part.text });
+          } else if (part.type === "image") {
+            parts.push({
+              type: "image_url",
+              image_url: { url: `data:${part.mimeType};base64,${part.data}` },
+            });
+          }
+        }
+        messages.push({ role: "user", content: parts });
+      }
+      continue;
+    }
+
+    if (message.role === "assistant") {
+      let text = "";
+      const toolCalls: Record<string, unknown>[] = [];
+      if (typeof message.content === "string") {
+        text = message.content;
+      } else if (Array.isArray(message.content)) {
+        for (const part of message.content) {
+          if (part.type === "text" && part.text) {
+            text += part.text;
+          } else if (part.type === "toolCall") {
+            toolCalls.push({
+              id: part.id,
+              type: "function",
+              function: {
+                name: part.name,
+                arguments: JSON.stringify(part.arguments ?? {}),
+              },
+            });
+          }
+        }
+      }
+      const assistant: Record<string, unknown> = { role: "assistant", content: text };
+      if (toolCalls.length > 0) {
+        assistant.tool_calls = toolCalls;
+        if (!text) assistant.content = null;
+      }
+      messages.push(assistant);
+      continue;
+    }
+
+    if (message.role === "toolResult") {
+      messages.push({
+        role: "tool",
+        tool_call_id: message.toolCallId,
+        content: toolResultText(message),
+      });
+    }
+  }
+
+  return messages;
 }
 
 function convertMessages(context: Context, isStartPlan = false): Record<string, unknown>[] {
@@ -189,7 +301,7 @@ function resolveEndpointForPlan(
   if (explicit && plan !== ZCodePlan.START_PLAN) {
     return explicit.endsWith("/chat/completions")
       ? explicit
-      : `${explicit.replace(/\/+$/, "")}/api/paas/v4/chat/completions`;
+      : `${explicit.replace(/\/+$/, "")}/api/coding/paas/v4/chat/completions`;
   }
 
   // Start Plan goes through the ZCode shared plan proxy.
@@ -198,9 +310,21 @@ function resolveEndpointForPlan(
   }
 
   if (model.baseUrl) {
-    return model.baseUrl.endsWith("/chat/completions")
-      ? model.baseUrl
-      : `${model.baseUrl.replace(/\/+$/, "")}/api/paas/v4/chat/completions`;
+    if (model.baseUrl.endsWith("/chat/completions")) {
+      return model.baseUrl;
+    }
+    // The registered provider baseUrl is a bare host (e.g. https://api.z.ai),
+    // and the paid Individual Plan only serves the coding subscription gateway.
+    // Concatenating blindly produced /api/paas/v4/chat/completions, which the
+    // upstream rejects with 1113 "Insufficient balance".
+    const base = model.baseUrl.replace(/\/+$/, "");
+    if (/\/api\/(coding\/)?paas\/v4$/.test(base)) {
+      return `${base}/chat/completions`;
+    }
+    if (/\/api\/paas\/v4$/.test(base)) {
+      return `${base.replace("/api/paas/v4", "/api/coding/paas/v4")}/chat/completions`;
+    }
+    return `${base}/api/coding/paas/v4/chat/completions`;
   }
 
   const host = resolveBaseHost(auth);
@@ -238,7 +362,50 @@ function buildRequestHeaders(
     }
     return buildStartPlanHeaders(auth, extra);
   }
-  return buildZCodeHeaders(auth);
+  return buildLlmZCodeHeaders(auth);
+}
+
+/**
+ * Pi (>= 0.8x) normalizes every request into a transcript: the system prompt and
+ * the tool declarations are leading `role:"system"` messages (`toolsAdded` /
+ * `toolsRemoved` deltas), and `context.systemPrompt` / `context.tools` are empty
+ * for a custom stream. Reading only the legacy fields sent every request without
+ * a system prompt and without tools, so the model truthfully answered "I have no
+ * access to a terminal".
+ *
+ * These two helpers mirror pi-ai's `getCurrentSystemPrompt` / `getCurrentTools`
+ * locally: importing them from `@earendil-works/pi-ai/utils/transcript` breaks on
+ * pi-ai builds whose `exports` map does not expose that subpath.
+ */
+function contentTextOf(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((part: any) => part && part.type === "text" && typeof part.text === "string")
+    .map((part: any) => part.text)
+    .join("\n");
+}
+
+function resolveTranscriptSystemPrompt(messages: readonly unknown[]): string {
+  const parts: string[] = [];
+  for (const raw of messages) {
+    const message = raw as { role?: string; content?: unknown };
+    if (message?.role !== "system") continue;
+    const text = contentTextOf(message.content);
+    if (text.length > 0) parts.push(text);
+  }
+  return parts.join("\n\n");
+}
+
+function resolveTranscriptTools(messages: readonly unknown[]): Tool[] {
+  const tools = new Map<string, Tool>();
+  for (const raw of messages) {
+    const message = raw as { role?: string; toolsAdded?: Tool[]; toolsRemoved?: Array<{ name: string }> };
+    if (message?.role !== "system") continue;
+    for (const tool of message.toolsRemoved ?? []) tools.delete(tool.name);
+    for (const tool of message.toolsAdded ?? []) tools.set(tool.name, tool);
+  }
+  return [...tools.values()];
 }
 
 function buildRequestBody({
@@ -246,16 +413,22 @@ function buildRequestBody({
   context,
   options,
   plan,
+  systemPrompt,
+  tools,
 }: {
   model: Model<Api>;
   context: Context;
   options: SimpleStreamOptions | undefined;
   plan: ZCodePlan;
+  /** Resolved from the transcript; `context.systemPrompt` is empty for custom streams. */
+  systemPrompt: string;
+  /** Resolved from the transcript; `context.tools` is empty for custom streams. */
+  tools: Tool[];
 }): Record<string, unknown> {
   if (plan === ZCodePlan.START_PLAN) {
-    const system = buildZCodeStartPlanSystem(context.systemPrompt, model.id);
+    const system = buildZCodeStartPlanSystem(systemPrompt, model.id);
     const messages = convertMessages(context, true);
-    const tools = convertTools(context.tools);
+    const anthropicTools = convertTools(tools);
 
     const body: Record<string, unknown> = {
       model: model.id,
@@ -266,8 +439,8 @@ function buildRequestBody({
       temperature: options?.temperature ?? 0.7,
     };
 
-    if (tools && tools.length > 0) {
-      body.tools = tools;
+    if (anthropicTools && anthropicTools.length > 0) {
+      body.tools = anthropicTools;
       body.tool_choice = { type: "auto" };
     }
 
@@ -279,17 +452,21 @@ function buildRequestBody({
     return body;
   }
 
-  // Standard PaaS chat completions format
+  // Standard PaaS chat completions format (Individual Plan).
   const body: Record<string, unknown> = {
     model: model.id,
-    messages: convertMessages(context, false),
+    messages: convertMessagesOpenAI(context, systemPrompt),
     max_tokens: model.maxTokens || 4096,
     stream: true,
+    stream_options: { include_usage: true },
     temperature: options?.temperature ?? 0.7,
   };
 
-  const tools = convertTools(context.tools);
-  if (tools) body.tools = tools;
+  const openaiTools = convertToolsOpenAI(tools);
+  if (openaiTools) {
+    body.tools = openaiTools;
+    body.tool_choice = "auto";
+  }
   if (model.reasoning && options?.reasoning) {
     body.reasoning_effort = model.thinkingLevelMap?.[options.reasoning] || "medium";
   }
@@ -360,7 +537,18 @@ export function streamZCode(
       }
 
       let headers = buildRequestHeaders(plan, auth, captchaParam);
-      const requestBody = buildRequestBody({ model, context, options, plan });
+      const requestBody = buildRequestBody({
+        model,
+        context,
+        options,
+        plan,
+        // Pi's normalized transcript keeps the system prompt and tool
+        // declarations as leading system messages; a custom stream that reads
+        // `context.systemPrompt` / `context.tools` gets empty values and the
+        // model then answers "I have no tools".
+        systemPrompt: context.systemPrompt || resolveTranscriptSystemPrompt(context.messages),
+        tools: context.tools && context.tools.length > 0 ? context.tools : resolveTranscriptTools(context.messages),
+      });
 
       stream.push({ type: "start", partial: output });
 
@@ -676,7 +864,11 @@ export function streamZCode(
               const inTokens = chunkUsage.prompt_tokens || 0;
               const outTokens = chunkUsage.completion_tokens || 0;
               const cached = chunkUsage.prompt_tokens_details?.cached_tokens || 0;
-              output.usage.input = inTokens;
+              // `prompt_tokens` already contains the cached prefix. Pi's convention
+              // (and its cost/context accounting) expects `input` to be the
+              // non-cached part, otherwise every cached token is billed twice and
+              // the context meter reads as if the window were almost full.
+              output.usage.input = Math.max(0, inTokens - cached);
               output.usage.output = outTokens;
               output.usage.cacheRead = cached;
               output.usage.totalTokens = inTokens + outTokens;
@@ -747,9 +939,22 @@ export function streamZCode(
   return stream;
 }
 
+// The plain `zcode` provider re-exports whatever plan is actually entitled.
+// Hardcoding START_PLAN there sent paid accounts to the start-plan gateway,
+// which answers 401 for them (and drags in a captcha solve) — the provider
+// registration sets this to the detected plan instead.
+let _fallbackPlan: ZCodePlan | undefined;
+
+export function setFallbackPlan(plan: ZCodePlan | undefined): void {
+  _fallbackPlan = plan;
+}
+
 function resolvePlanFromModel(model: Model<Api>): ZCodePlan {
   if (model.provider === "zcode-individual-plan" || model.provider === "zcode-individual") {
     return ZCodePlan.INDIVIDUAL_PLAN;
   }
-  return ZCodePlan.START_PLAN;
+  if (model.provider === "zcode-start-plan") {
+    return ZCodePlan.START_PLAN;
+  }
+  return _fallbackPlan ?? ZCodePlan.START_PLAN;
 }
