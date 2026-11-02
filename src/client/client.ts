@@ -10,7 +10,7 @@ export const DEFAULT_BIGMODEL_ENDPOINT = "https://open.bigmodel.cn";
 export const DEFAULT_ZCODE_APP_ENDPOINT = "https://zcode.z.ai";
 export const DEFAULT_ZCODE_PLAN_ENDPOINT = "https://zcode.z.ai/api/v1/zcode-plan";
 
-export const APP_VERSION = "3.10.2";
+export const APP_VERSION = "3.14.3";
 export const PLATFORM = `${process.platform}-${process.arch}`;
 export const OS_CATEGORY =
   process.platform === "darwin" ? "macos" : process.platform === "win32" ? "windows" : "linux";
@@ -61,23 +61,39 @@ export function prewarmConnection(endpoint = DEFAULT_ENDPOINT): void {
 }
 
 /**
- * The set of source headers ZCode injects on every request. Omitting them —
- * especially X-Device-Mid — can trigger `3001 parameter error`.
+ * Source headers the ZCode client attaches to its requests.
+ *
+ * Two shapes exist in the real client: the control plane (billing, claim,
+ * entitlement probing) always carries X-Device-Mid, while the LLM completion
+ * path never does. Pass `includeDeviceMid: false` for completions so the
+ * fingerprint matches the client instead of looking like a device-id-carrying
+ * impostor.
  */
-export function buildZCodeSourceHeaders(referer = "https://zcode.z.ai"): Record<string, string> {
+export function buildZCodeSourceHeaders(
+  referer = "https://zcode.z.ai",
+  opts: { includeDeviceMid?: boolean } = {},
+): Record<string, string> {
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  let language = "unknown";
+  try {
+    language = Intl.DateTimeFormat().resolvedOptions().locale || "unknown";
+  } catch {
+    // keep the "unknown" fallback, matching the client's own try/catch
+  }
   return {
     "HTTP-Referer": referer,
     "User-Agent": `ZCode/${APP_VERSION}`,
-    "X-Client-Language": "en-US",
+    "X-Client-Language": language,
     "X-Client-Timezone": timezone,
-    "X-Device-Mid": getDeviceMid(),
+    ...(opts.includeDeviceMid === false ? {} : { "X-Device-Mid": getDeviceMid() }),
     "X-Os-Category": OS_CATEGORY,
     "X-Os-Version": release(),
     "X-Platform": PLATFORM,
-    "X-Release-Channel": "stable",
-    "X-Title": "Z Code@pi-zcode",
+    "X-Release-Channel": "production",
+    "X-Title": "Z Code@cli",
     "X-ZCode-App-Version": APP_VERSION,
+    // Emitted by the real client's LLM header builder (x4i) as the last entry.
+    "X-ZCode-Agent": "glm",
   };
 }
 
@@ -158,6 +174,25 @@ export function buildZCodeHeaders(
     headers["X-Zcode-Token"] = auth.zcodeJwtToken;
   }
 
+  return headers;
+}
+
+/**
+ * Headers for the LLM completion request: the client's LLM shape (no
+ * X-Device-Mid), plus credentials.
+ */
+export function buildLlmZCodeHeaders(auth: ZCodeParsedApiKey): Record<string, string> {
+  const headers: Record<string, string> = {
+    Accept: "application/json, text/event-stream",
+    "Content-Type": "application/json",
+    ...buildZCodeSourceHeaders("https://zcode.z.ai", { includeDeviceMid: false }),
+  };
+  if (auth.token) {
+    headers["Authorization"] = `Bearer ${auth.token}`;
+  }
+  if (auth.zcodeJwtToken) {
+    headers["X-Zcode-Token"] = auth.zcodeJwtToken;
+  }
   return headers;
 }
 
